@@ -1,0 +1,16 @@
+{
+  "name": "fnf-multiplayer-relay",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Lobby + realtime relay server for SORO ENGINE's 1v1 multiplayer",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  }
+}
