@@ -4,6 +4,8 @@
 //   - create/join lobbies with codes like "FNFLOBBY-XXXXXX"
 //   - public lobby listing
 //   - relay the host's chosen song (JSON only — no audio bytes) to the guest
+//   - relay each player's chosen character (one per player, as a data-URL atlas — never the
+//     sender's whole local library) so both sides can render each other correctly
 //   - relay ready state and a synced countdown start (same absolute timestamp to both clients)
 //   - relay live hit/miss/finish events between the two players during a match
 //
@@ -22,6 +24,9 @@ const { WebSocketServer } = require('ws');
 const PORT = process.env.PORT || 8080;
 // no 0/O/1/I/L — avoids visually-confusable characters in lobby codes
 const CODE_CHARS = 'ABCDEFGHJKMNPQRSTUVWXYZ23456789';
+// a character carries one atlas (+ optional icon) as a base64 data URL — generous but bounded,
+// so one oversized sprite sheet can't be used to flood the relay
+const MAX_CHAR_JSON_BYTES = 8 * 1024 * 1024;
 
 function genCode() {
   let s = '';
@@ -29,7 +34,7 @@ function genCode() {
   return 'FNFLOBBY-' + s;
 }
 
-/** @type {Map<string, {code:string, isPrivate:boolean, players:Map<import('ws').WebSocket,{id:number,name:string,ready:boolean}>, song:any, hostWs:import('ws').WebSocket}>} */
+/** @type {Map<string, {code:string, isPrivate:boolean, players:Map<import('ws').WebSocket,{id:number,name:string,ready:boolean,char:any}>, song:any, hostWs:import('ws').WebSocket}>} */
 const lobbies = new Map();
 let nextPlayerId = 1;
 
@@ -95,7 +100,7 @@ wss.on('connection', (ws) => {
       const lobby = { code, isPrivate: !!msg.isPrivate, players: new Map(), song: null, hostWs: ws };
       ws.playerName = (msg.name || ws.playerName).slice(0, 24);
       ws.device = msg.device === 'mobile' ? 'mobile' : 'desktop';
-      lobby.players.set(ws, { id: ws.playerId, name: ws.playerName, ready: false, device: ws.device });
+      lobby.players.set(ws, { id: ws.playerId, name: ws.playerName, ready: false, device: ws.device, char: null });
       lobbies.set(code, lobby);
       ws.lobbyCode = code;
       send(ws, { type: 'lobby_created', code, isPrivate: lobby.isPrivate, players: lobbyPlayerList(lobby), youId: ws.playerId, isHost: true });
@@ -109,11 +114,16 @@ wss.on('connection', (ws) => {
       if (lobby.players.size >= 2) { send(ws, { type: 'error', message: 'Лобби уже заполнено.' }); return; }
       ws.playerName = (msg.name || ws.playerName).slice(0, 24);
       ws.device = msg.device === 'mobile' ? 'mobile' : 'desktop';
-      lobby.players.set(ws, { id: ws.playerId, name: ws.playerName, ready: false, device: ws.device });
+      lobby.players.set(ws, { id: ws.playerId, name: ws.playerName, ready: false, device: ws.device, char: null });
       ws.lobbyCode = lobby.code;
       send(ws, { type: 'lobby_joined', code: lobby.code, isPrivate: lobby.isPrivate, players: lobbyPlayerList(lobby), youId: ws.playerId, isHost: false });
       broadcast(lobby, { type: 'player_joined', player: { id: ws.playerId, name: ws.playerName, ready: false, device: ws.device } }, ws);
       if (lobby.song) send(ws, { type: 'song_sync', song: lobby.song });
+      // catch up the joiner on whichever character(s) the other player(s) already picked —
+      // just theirs, not a library, same as a fresh set_char relay
+      for (const [otherWs, p] of lobby.players) {
+        if (otherWs !== ws && p.char) send(ws, { type: 'char_sync', char: p.char, from: p.id });
+      }
       return;
     }
 
@@ -138,6 +148,19 @@ wss.on('connection', (ws) => {
       if (ws !== lobby.hostWs) return; // only the host assigns roles
       lobby.roles = msg.roles;
       broadcast(lobby, { type: 'roles_sync', roles: msg.roles }, ws);
+      return;
+    }
+
+    if (msg.type === 'set_char') {
+      // either player sends their OWN single character — never a whole library, so there's
+      // nothing to filter here beyond a basic size guard against an oversized atlas
+      if (Buffer.byteLength(raw) > MAX_CHAR_JSON_BYTES) {
+        send(ws, { type: 'error', message: 'Файл персонажа слишком большой для передачи сопернику.' });
+        return;
+      }
+      const p = lobby.players.get(ws);
+      if (p) p.char = msg.char || null;
+      broadcast(lobby, { type: 'char_sync', char: msg.char || null, from: ws.playerId }, ws);
       return;
     }
 
